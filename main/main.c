@@ -9,8 +9,8 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 
-#define WIFI_SSID "NHome"
-#define WIFI_PASS "Bright6963Dance"
+#define WIFI_SSID "SSID"
+#define WIFI_PASS "YourPassword"
 
 static const char* TAG = "CAMERA";
 static EventGroupHandle_t wifi_event_group;
