@@ -1,20 +1,57 @@
-#include "esp_camera.h"
-#include "esp_log.h"
-#include "esp_netif.h"
-#include "esp_event.h"
-#include "esp_http_server.h"
-#include "nvs_flash.h"
-#include "esp_wifi.h"
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_log.h"
 
-#define WIFI_SSID "NHome"
-#define WIFI_PASS "Bright6963Dance"
+#include "esp_camera.h"
 
-static const char* TAG = "CAMERA";
-static EventGroupHandle_t wifi_event_group;
-const int CONNECTED_BIT = BIT0;
+
+#define WIFI_SSID      "NHome"
+#define WIFI_PASS      "Bright6963Dance"
+
+#define PC_IP          "192.168.1.88"   // PC running UDP receiver
+#define PC_PORT        5000
+
+#define MAX_PAYLOAD    1200
+
+typedef struct {
+    uint16_t frame_id;
+    uint16_t packet_id;
+    uint16_t total_packets;
+    uint16_t payload_size;
+} __attribute__((packed)) udp_header_t;
+
+
+static void wifi_init(void)
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_start();
+    esp_wifi_connect();
+}
+
 
 camera_config_t camera_config = {
     .pin_pwdn = -1,
@@ -39,120 +76,77 @@ camera_config_t camera_config = {
     .ledc_channel = LEDC_CHANNEL_0,
     .pixel_format = PIXFORMAT_JPEG,
     .frame_size = FRAMESIZE_QQVGA,
-    .jpeg_quality = 12,
+    .jpeg_quality = 25,
     .fb_count = 1,
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_LATEST
 };
 
-// WiFi event handler
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                               int32_t event_id, void* event_data)
+static void udp_stream_task(void *arg)
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGI(TAG, "Disconnected. Reconnecting...");
-        esp_wifi_connect();
-        xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        char ip_str[16];
-        ESP_LOGI(TAG, "Got IP: %s", esp_ip4addr_ntoa(&event->ip_info.ip, ip_str, sizeof(ip_str)));
-        xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
-    }
-}
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
 
-// Initialize Wi-Fi as station and wait for connection
-void wifi_init_sta(void)
-{
-    wifi_event_group = xEventGroupCreate();
+    struct sockaddr_in dest_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(PC_PORT),
+        .sin_addr.s_addr = inet_addr(PC_IP),
+    };
 
-    ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    // Register event handlers
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
-
-    wifi_config_t wifi_config = {};
-    strncpy((char*)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid));
-    strncpy((char*)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password));
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "Connecting to WiFi...");
-    xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
-}
-
-// Camera HTTP streaming handler
-esp_err_t stream_handler(httpd_req_t *req) {
-    char part_buf[64];
-    camera_fb_t *fb = NULL;
-
-    httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=frame");
+    uint16_t frame_id = 0;
 
     while (1) {
-        fb = esp_camera_fb_get();
+        camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) continue;
 
-        int hlen = snprintf(part_buf, sizeof(part_buf),
-                            "\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-                            fb->len);
-        httpd_resp_send_chunk(req, part_buf, hlen);
-        httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
+        frame_id++;
+
+        uint16_t total_packets =
+            (fb->len + MAX_PAYLOAD - 1) / MAX_PAYLOAD;
+
+        for (uint16_t i = 0; i < total_packets; i++) {
+            udp_header_t header;
+            header.frame_id = frame_id;
+            header.packet_id = i;
+            header.total_packets = total_packets;
+
+            uint32_t offset = i * MAX_PAYLOAD;
+            header.payload_size =
+                (fb->len - offset > MAX_PAYLOAD)
+                ? MAX_PAYLOAD
+                : fb->len - offset;
+
+            uint8_t buffer[sizeof(header) + MAX_PAYLOAD];
+            memcpy(buffer, &header, sizeof(header));
+            memcpy(buffer + sizeof(header),
+                   fb->buf + offset,
+                   header.payload_size);
+
+            sendto(sock,
+                   buffer,
+                   sizeof(header) + header.payload_size,
+                   0,
+                   (struct sockaddr *)&dest_addr,
+                   sizeof(dest_addr));
+        }
 
         esp_camera_fb_return(fb);
-        vTaskDelay(pdMS_TO_TICKS(30)); // ~30 FPS
-    }
 
-    return ESP_OK;
-}
-
-// Start the camera HTTP server
-void start_camera_server(void) {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    httpd_handle_t server = NULL;
-
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t stream_uri = {
-            .uri = "/stream",
-            .method = HTTP_GET,
-            .handler = stream_handler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &stream_uri);
-        ESP_LOGI(TAG, "Camera server started at /stream");
+        vTaskDelay(pdMS_TO_TICKS(10)); // ~30–40 FPS
     }
 }
+void app_main(void)
+{
+    nvs_flash_init();
+    wifi_init();
+    esp_camera_init(&camera_config);
 
-void app_main(void) {
-    wifi_init_sta();  // Waits for IP and prints it
-
-    ESP_LOGI(TAG, "WiFi connected. Starting camera...");
-
-    esp_err_t err = esp_camera_init(&camera_config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init failed: 0x%x", err);
-        return;
-    }
-
-    ESP_LOGI(TAG, "Camera initialized successfully");
-
-    start_camera_server();
+    xTaskCreatePinnedToCore(
+        udp_stream_task,
+        "udp_stream",
+        8192,
+        NULL,
+        5,
+        NULL,
+        1
+    );
 }
