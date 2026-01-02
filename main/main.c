@@ -14,8 +14,8 @@
 #include "esp_camera.h"
 
 
-#define WIFI_SSID      "NHome"
-#define WIFI_PASS      "Bright6963Dance"
+#define WIFI_SSID      "SSID"
+#define WIFI_PASS      "PASSWD"
 
 #define PC_IP          "192.168.1.88"   // PC running UDP receiver
 #define PC_PORT        5000
