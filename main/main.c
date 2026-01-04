@@ -10,7 +10,7 @@
 #include "esp_camera.h"
 
 
-#define THRESHOLD 100 //0-255 for sensitivity of object detection
+#define THRESHOLD 210 //0-255 for sensitivity of object detection
 
 #define FRAME_QUEUE_LENGTH 2
 
@@ -70,6 +70,20 @@ void capture_frame_task(void *arg){
         
 static int center_offset[2];
 
+void print_img(bool *buf, uint8_t w, uint8_t h){
+
+    printf("--------------------------------------start frame-----------------------------\n");
+    for(int y = 0; y < h; y+=4){
+        for(int x = 0; x < w; x+=4){
+            
+            printf("%d ", buf[y * w + x]);
+        }
+        printf("\n");
+    }
+    printf("--------------------------------------end frame-----------------------------\n");
+}
+
+
 void process_frame(camera_fb_t *fb){
     
     uint8_t width = fb->width;
@@ -88,38 +102,42 @@ void process_frame(camera_fb_t *fb){
         uint8_t w = 160;
         uint8_t h = 120;
 
-        static uint8_t prev[160 * 120];//cant use variables here remember to update this if changing resoloution
-        memset(prev, 0, w*h);
+        static bool bin_edge[160*120];
 
-        int sum_x = 0;
-        int sum_y = 0;
-        int count = 0;
 
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                uint8_t p = fb->buf[y*w + x];
-                uint8_t pp = prev[y*w + x];
-                if (abs(p - pp) > THRESHOLD) {
-                    sum_x += x;
-                    sum_y += y;
-                    count++;
+
+        uint8_t count = 0;
+
+        int objects[32];
+
+        for (int y = 1; y < h - 1; y++) {
+            for (int x = 1; x < w - 1; x++) {
+
+                uint8_t p0 = fb->buf[(y-1) * width + (x-1)];
+                uint8_t p1 = fb->buf[(y-1) * width + x];
+                uint8_t p2 = fb->buf[(y-1) * width + (x+1)];
+                uint8_t p3 = fb->buf[y * width + (x-1)];
+                uint8_t p4 = fb->buf[y * width + x];
+                uint8_t p5 = fb->buf[y * width + (x+1)];
+                uint8_t p6 = fb->buf[(y+1) * width + (x-1)];
+                uint8_t p7 = fb->buf[(y+1) * width + x];
+                uint8_t p8 = fb->buf[(y+1) * width + (x+1)];
+
+                int gx = -p0 + p1 + p2 - (2*p3) + p4 + (2*p5) - p6 + p7 + p8;
+                int gy = -p0 - (2*p1) - p2 + p3 + p4 + p5 + p6 + (2*p7) + p8; 
+
+                if(abs(gx) > THRESHOLD){
+                    bin_edge[y * width + x] = 1;
+                }else if(abs(gy) > THRESHOLD){
+                    bin_edge[y * width + x] = 1;
+                }else{
+                    bin_edge[y * width + x] = 0;
                 }
-                prev[y*w + x] = p;
             }
         }
 
-        if(count != 0){
-            uint8_t cx = sum_x / count;
-            uint8_t cy = sum_y / count;
-            
-            center_offset[0] = (w/2) - cx;
-            center_offset[1] = (h/2) - cy;
-            
-            printf("CENTROID OFFSET DATA--> X: %d, Y: %d\n", center_offset[0], center_offset[1]);
-        
-        }else{
-            printf("NO OBJECTS DETECTED\n");
-        }
+        print_img(bin_edge, w, h);
+
 
     }else{
         ESP_LOGE("FRAME PROCESSING: ", "unexpected image format!");
