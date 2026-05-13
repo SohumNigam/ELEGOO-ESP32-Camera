@@ -12,12 +12,14 @@
 #include "esp_log.h"
 #include "esp_camera.h"
 
-#define WIFI_SSID      "SSID"
-#define WIFI_PASS      "PSWD"
+#define WIFI_SSID      "NHome"
+#define WIFI_PASS      "Bright6963Dance"
 
-#define PC_IP          "192.168.111.111"   // PC running UDP receiver
+#define PC_IP          "192.168.1.88"   // PC running UDP receiver
 #define PC_PORT        5000
 #define MAX_PAYLOAD    1200
+
+
 
 const bool streaming = true;
 
@@ -52,7 +54,7 @@ static void wifi_init(void)
 }
 
 
-#define THRESHOLD 100 // 0–255 sensitivity of object detection
+#define THRESHOLD 150 // sensitivity of edge detection
 #define FRAME_QUEUE_LENGTH 2
 
 
@@ -90,11 +92,10 @@ camera_config_t camera_config = {
 
 
 static QueueHandle_t frame_queue;
-static int center_offset[2];
 
 
-void capture_frame_task(void *arg)
-{
+
+void capture_frame_task(void *arg){
     while (1) {
         camera_fb_t *fb = esp_camera_fb_get();
 
@@ -111,52 +112,144 @@ void capture_frame_task(void *arg)
 }
 
 
+int8_t gaussian3x3[] ={ 
+                1, 2, 1,
+                2, 4, 2,
+                1, 2, 1,
+};
+
+int8_t GY_3x3[] ={ 
+                -1, -2, -1,
+                0, 0, 0,
+                1, 2, 1,
+};
+
+int8_t GX_3x3[] ={ 
+                -1, 0, 1,
+                -2, 0, 2,
+                -1, 0, 1,
+};
+
+
+//NOTE: Implement multiple jernel sixe compatibility
+void apply_kernel(uint8_t *input, uint8_t *output, const int8_t *kernel, int divisor, int w, int h){
+
+    for(int y = 1; y < h - 1; y++){
+        for(int x = 1; x < w - 1; x++){
+
+            int pixel = (input[(y-1) * w + (x-1)] * kernel[0] +
+                            input[(y-1) * w + (x)] * kernel[1] +
+                            input[(y-1) * w + (x+1)] * kernel[2] +
+                            input[(y) * w + (x-1)] * kernel[3] +
+                            input[(y) * w + (x)] * kernel[4] +
+                            input[(y) * w + (x+1)] * kernel[5] +
+                            input[(y+1) * w + (x-1)] * kernel[6] +
+                            input[(y+1) * w + (x)] * kernel[7] +
+                            input[(y+1) * w + (x+1)] * kernel[8]
+            ); 
+            
+                            
+            pixel /= divisor;
+
+            if(pixel < 0) pixel = 0;
+            if(pixel > 255) pixel = 255;
+
+            output[y * w + x] = pixel;
+
+        }
+    }
+
+}
+
+void apply_kernel_t16(uint8_t *input, int16_t *output, const int8_t *kernel, int divisor, int w, int h){
+
+    for(int y = 1; y < h - 1; y++){
+        for(int x = 1; x < w - 1; x++){
+
+            int pixel = (input[(y-1) * w + (x-1)] * kernel[0] +
+                            input[(y-1) * w + (x)] * kernel[1] +
+                            input[(y-1) * w + (x+1)] * kernel[2] +
+                            input[(y) * w + (x-1)] * kernel[3] +
+                            input[(y) * w + (x)] * kernel[4] +
+                            input[(y) * w + (x+1)] * kernel[5] +
+                            input[(y+1) * w + (x-1)] * kernel[6] +
+                            input[(y+1) * w + (x)] * kernel[7] +
+                            input[(y+1) * w + (x+1)] * kernel[8]
+            ); 
+            
+                            
+            pixel /= divisor;
+
+            output[y * w + x] = pixel;
+
+        }
+    }
+
+}
+
+
+//define buffers once globally on startup to avoid repeated memory allocation
+
+static uint8_t *blurred = NULL;
+static int16_t *gx = NULL;
+static int16_t *gy = NULL;
+static uint8_t *edges = NULL;
+
+bool allocated_buffers = false;
+
+
 void process_frame(camera_fb_t *fb)
 {
-    uint8_t width = fb->width;
-    uint8_t height = fb->height;
+    int w = fb->width;
+    int h = fb->height;
 
-    if (fb->format == PIXFORMAT_GRAYSCALE && width == 160 && height == 120) {
+     // allocate/reallocate if resolution changed
+    if (!allocated_buffers) {
 
-        uint8_t w = 160;
-        uint8_t h = 120;
+        free(blurred);
+        free(gx);
+        free(gy);
+        free(edges);
 
-        static uint8_t prev[160 * 120];
+        blurred = malloc(w * h);
+        gx = malloc(w * h * sizeof(int16_t));
+        gy = malloc(w * h * sizeof(int16_t));
+        edges = malloc(w * h);
 
-        int sum_x = 0;
-        int sum_y = 0;
-        int count = 0;
+        if (!blurred || !gx || !gy || !edges) {
+            ESP_LOGE("MEMORY", "Allocation failed");
+            return;
+        }
 
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
+        allocated_buffers = true;
+    }
 
-                uint8_t p  = fb->buf[y * w + x];
-                uint8_t pp = prev[y * w + x];
+    
+    if (fb->format == PIXFORMAT_GRAYSCALE && w == 160 && h == 120) {
+        
+        apply_kernel(fb->buf, blurred, gaussian3x3, 16, w, h);
+        
+        apply_kernel_t16(blurred, gx, GX_3x3, 1, w, h);
+        apply_kernel_t16(blurred, gy, GY_3x3, 1, w, h);
 
-                if (abs(p - pp) > THRESHOLD) {
-                    sum_x += x;
-                    sum_y += y;
-                    count++;
+        for(int y = 0; y < h; y++){
+            for(int x = 0; x < w; x++){
+
+                int magnitude = abs(gx[y * w + x]) + abs(gy[y * w + x]);
+
+                if(magnitude > THRESHOLD){
+                    edges[y * w + x] = 255;
+                }else{
+                    edges[y * w + x] = 0;
                 }
 
-                prev[y * w + x] = p;
+
             }
         }
 
-        if (count != 0) {
-            uint8_t cx = sum_x / count;
-            uint8_t cy = sum_y / count;
-
-            center_offset[0] = (w / 2) - cx;
-            center_offset[1] = (h / 2) - cy;
-
-            printf("CENTROID OFFSET DATA--> X: %d, Y: %d\n",
-                   center_offset[0],
-                   center_offset[1]);
-        } else {
-            printf("NO OBJECTS DETECTED\n");
-        }
-
+        
+        
+        
     } else {
         ESP_LOGE("FRAME PROCESSING", "unexpected image format!");
     }
@@ -164,6 +257,9 @@ void process_frame(camera_fb_t *fb)
 
 
 // Frame processing task
+uint8_t *stream_buffer;
+uint32_t stream_size;
+
 void frame_processing_task(void *arg)
 {
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
@@ -190,8 +286,15 @@ void frame_processing_task(void *arg)
 
             frame_id++;
 
+            stream_buffer = NULL;
+            stream_size = 0;
+
+            //chage to whatever buffer and size i want
+            stream_buffer = edges;
+            stream_size = fb->height * fb->width;
+
             uint16_t total_packets =
-                (fb->len + MAX_PAYLOAD - 1) / MAX_PAYLOAD;
+                (stream_size + MAX_PAYLOAD - 1) / MAX_PAYLOAD;
 
             for (uint16_t i = 0; i < total_packets; i++) {
 
@@ -204,15 +307,15 @@ void frame_processing_task(void *arg)
                 uint32_t offset = i * MAX_PAYLOAD;
 
                 header.payload_size =
-                    (fb->len - offset > MAX_PAYLOAD)
+                    (stream_size - offset > MAX_PAYLOAD)
                         ? MAX_PAYLOAD
-                        : fb->len - offset;
+                        : stream_size - offset;
 
                 static uint8_t buffer[sizeof(udp_header_t) + MAX_PAYLOAD];
 
                 memcpy(buffer, &header, sizeof(header));
                 memcpy(buffer + sizeof(header),
-                       fb->buf + offset,
+                       stream_buffer + offset,
                        header.payload_size);
 
                 sendto(sock,

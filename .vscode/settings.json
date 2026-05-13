@@ -5,7 +5,7 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.portWin": "COM5",
+  "idf.portWin": "COM6",
   "idf.toolsPathWin": "c:\\Espressif\\tools",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
@@ -16,5 +16,6 @@
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\nigam\\OneDrive\\Desktop\\ESP32\\Camera\\build"
   ],
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.currentSetup": "C:\\Users\\nigam\\esp\\v5.5.1\\esp-idf"
 }
