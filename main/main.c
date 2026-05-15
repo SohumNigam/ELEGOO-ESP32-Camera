@@ -12,8 +12,8 @@
 #include "esp_log.h"
 #include "esp_camera.h"
 
-#define WIFI_SSID      "NHome"
-#define WIFI_PASS      "Bright6963Dance"
+#define WIFI_SSID      "******"
+#define WIFI_PASS      "******"
 
 #define PC_IP          "192.168.1.88"   // PC running UDP receiver
 #define PC_PORT        5000
@@ -54,7 +54,7 @@ static void wifi_init(void)
 }
 
 
-#define THRESHOLD 150 // sensitivity of edge detection
+#define THRESHOLD 110 // sensitivity of edge detection
 #define FRAME_QUEUE_LENGTH 2
 
 
@@ -85,7 +85,7 @@ camera_config_t camera_config = {
     .pixel_format = PIXFORMAT_GRAYSCALE,
     .frame_size = FRAMESIZE_QQVGA,
 
-    .fb_count = 1,
+    .fb_count = 3,
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_LATEST
 };
@@ -112,6 +112,14 @@ void capture_frame_task(void *arg){
 }
 
 
+//invert image and erode to get correct effect
+int8_t erode_dilate3x3[] ={ 
+                1, 1, 1,
+                1, 1, 1,
+                1, 1, 1,
+};
+
+
 int8_t gaussian3x3[] ={ 
                 1, 2, 1,
                 2, 4, 2,
@@ -130,6 +138,52 @@ int8_t GX_3x3[] ={
                 -1, 0, 1,
 };
 
+
+
+void dilate(uint8_t *in, uint8_t *out, int w, int h)
+{
+    for(int y = 1; y < h - 1; y++){
+        for(int x = 1; x < w - 1; x++){
+
+            uint8_t max = 0;
+
+            for(int j = -1; j <= 1; j++){
+                for(int i = -1; i <= 1; i++){
+
+                    uint8_t val = in[(y+j) * w + (x+i)];
+
+                    if(val > max)
+                        max = val;
+                }
+            }
+
+            out[y * w + x] = max;
+        }
+    }
+}
+
+
+void erode(uint8_t *in, uint8_t *out, int w, int h)
+{
+    for(int y = 1; y < h - 1; y++){
+        for(int x = 1; x < w - 1; x++){
+
+            uint8_t min = 255;
+
+            for(int j = -1; j <= 1; j++){
+                for(int i = -1; i <= 1; i++){
+
+                    uint8_t val = in[(y+j) * w + (x+i)];
+
+                    if(val < min)
+                        min = val;
+                }
+            }
+
+            out[y * w + x] = min;
+        }
+    }
+}
 
 //NOTE: Implement multiple jernel sixe compatibility
 void apply_kernel(uint8_t *input, uint8_t *output, const int8_t *kernel, int divisor, int w, int h){
@@ -187,6 +241,48 @@ void apply_kernel_t16(uint8_t *input, int16_t *output, const int8_t *kernel, int
 
 }
 
+typedef struct{
+    int x;
+    int y;
+}point_t;
+
+void flood_fill(uint8_t *img, uint8_t *labels, point_t *stack, int w, int h, int sx, int sy, uint16_t label_id){
+
+    int top = 0;
+
+    if(img[sy * w + sx] == 0) return;
+    if(labels[sy * w + sx] != 0) return;
+
+    stack[top++] = (point_t){sx, sy};
+
+    while(top > 0){
+
+        point_t p = stack[--top];
+        int x = p.x;
+        int y = p.y;
+
+        if(x < 0 || x >= w || y < 0 || y >= h)
+            continue;
+
+        int idx = y * w + x;
+
+        if(img[idx] == 0)
+            continue;
+
+        if(labels[idx] != 0)
+            continue;
+
+        labels[idx] = label_id;
+
+        // 4-neighborhood (faster)
+        stack[top++] = (point_t){x+1, y};
+        stack[top++] = (point_t){x-1, y};
+        stack[top++] = (point_t){x, y+1};
+        stack[top++] = (point_t){x, y-1};
+    }
+}
+
+
 
 //define buffers once globally on startup to avoid repeated memory allocation
 
@@ -194,6 +290,14 @@ static uint8_t *blurred = NULL;
 static int16_t *gx = NULL;
 static int16_t *gy = NULL;
 static uint8_t *edges = NULL;
+static uint8_t *labels = NULL;
+static point_t *stack = NULL; 
+static uint8_t *dilated = NULL; 
+static uint8_t *dilated_inv = NULL; 
+static uint8_t *eroded_inv = NULL; 
+static uint8_t *eroded = NULL; 
+
+
 
 bool allocated_buffers = false;
 
@@ -210,11 +314,24 @@ void process_frame(camera_fb_t *fb)
         free(gx);
         free(gy);
         free(edges);
-
+        free(labels);
+        free(stack);
+        free(dilated);
+        free(dilated_inv);
+        free(eroded_inv);
+        free(eroded);
+        
         blurred = malloc(w * h);
         gx = malloc(w * h * sizeof(int16_t));
         gy = malloc(w * h * sizeof(int16_t));
         edges = malloc(w * h);
+        labels = malloc(w * h);
+        stack  = malloc(w * h * sizeof(point_t));
+        dilated = malloc(w * h);
+        dilated_inv = malloc(w * h);
+        eroded_inv = malloc(w * h);
+        eroded = malloc(w * h);
+
 
         if (!blurred || !gx || !gy || !edges) {
             ESP_LOGE("MEMORY", "Allocation failed");
@@ -235,20 +352,42 @@ void process_frame(camera_fb_t *fb)
         for(int y = 0; y < h; y++){
             for(int x = 0; x < w; x++){
 
-                int magnitude = abs(gx[y * w + x]) + abs(gy[y * w + x]);
+                int idx = y * w + x;
+
+                int magnitude = abs(gx[idx]) + abs(gy[idx]);
 
                 if(magnitude > THRESHOLD){
-                    edges[y * w + x] = 255;
+                    edges[idx] = 255;
                 }else{
-                    edges[y * w + x] = 0;
+                    edges[idx] = 0;
                 }
 
 
             }
         }
 
-        
-        
+    dilate(edges, dilated, w, h);
+    erode(dilated, eroded, w, h);
+
+
+
+    /*
+    uint16_t label = 1;
+
+    memset(labels, 0, w * h);
+    
+    for(int y = 0; y < h; y++){
+        for(int x = 0; x < w; x++){
+
+            int idx = y * w + x;
+
+            if(edges[idx] == 0 && labels[idx] == 0){
+                flood_fill(edges, labels, stack, w, h, x, y, label);
+                label++;
+            }
+        }
+    }
+      */  
         
     } else {
         ESP_LOGE("FRAME PROCESSING", "unexpected image format!");
@@ -290,7 +429,7 @@ void frame_processing_task(void *arg)
             stream_size = 0;
 
             //chage to whatever buffer and size i want
-            stream_buffer = edges;
+            stream_buffer = eroded;
             stream_size = fb->height * fb->width;
 
             uint16_t total_packets =
