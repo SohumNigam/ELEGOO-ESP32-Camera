@@ -12,8 +12,8 @@
 #include "esp_log.h"
 #include "esp_camera.h"
 
-#define WIFI_SSID      "******"
-#define WIFI_PASS      "******"
+#define WIFI_SSID      "NHome"
+#define WIFI_PASS      "Bright6963Dance"
 
 #define PC_IP          "192.168.1.88"   // PC running UDP receiver
 #define PC_PORT        5000
@@ -54,7 +54,7 @@ static void wifi_init(void)
 }
 
 
-#define THRESHOLD 110 // sensitivity of edge detection
+int THRESHOLD = 10000; // sensitivity of edge detection
 #define FRAME_QUEUE_LENGTH 2
 
 
@@ -85,7 +85,7 @@ camera_config_t camera_config = {
     .pixel_format = PIXFORMAT_GRAYSCALE,
     .frame_size = FRAMESIZE_QQVGA,
 
-    .fb_count = 3,
+    .fb_count = 2,
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_LATEST
 };
@@ -138,52 +138,6 @@ int8_t GX_3x3[] ={
                 -1, 0, 1,
 };
 
-
-
-void dilate(uint8_t *in, uint8_t *out, int w, int h)
-{
-    for(int y = 1; y < h - 1; y++){
-        for(int x = 1; x < w - 1; x++){
-
-            uint8_t max = 0;
-
-            for(int j = -1; j <= 1; j++){
-                for(int i = -1; i <= 1; i++){
-
-                    uint8_t val = in[(y+j) * w + (x+i)];
-
-                    if(val > max)
-                        max = val;
-                }
-            }
-
-            out[y * w + x] = max;
-        }
-    }
-}
-
-
-void erode(uint8_t *in, uint8_t *out, int w, int h)
-{
-    for(int y = 1; y < h - 1; y++){
-        for(int x = 1; x < w - 1; x++){
-
-            uint8_t min = 255;
-
-            for(int j = -1; j <= 1; j++){
-                for(int i = -1; i <= 1; i++){
-
-                    uint8_t val = in[(y+j) * w + (x+i)];
-
-                    if(val < min)
-                        min = val;
-                }
-            }
-
-            out[y * w + x] = min;
-        }
-    }
-}
 
 //NOTE: Implement multiple jernel sixe compatibility
 void apply_kernel(uint8_t *input, uint8_t *output, const int8_t *kernel, int divisor, int w, int h){
@@ -241,61 +195,91 @@ void apply_kernel_t16(uint8_t *input, int16_t *output, const int8_t *kernel, int
 
 }
 
+
+int sad_score(uint8_t *curr, uint8_t *prev, int x, int y, int dx, int dy, uint8_t w){
+    
+    int score = 0;
+
+    for(int j = -2; j < 2; j++){
+        for(int i = -2; i < 2; i++){
+            
+            uint8_t p1 = prev[(y + j) * w + (x + i)];
+            uint8_t p2 = curr[(y + dy + j) * w + (x + dx + i)];
+
+            score += abs(p2 - p1);
+        }
+    }
+
+
+    return score;
+}
+
+
 typedef struct{
     int x;
     int y;
-}point_t;
 
-void flood_fill(uint8_t *img, uint8_t *labels, point_t *stack, int w, int h, int sx, int sy, uint16_t label_id){
+    int dx;
+    int dy;
+}feature_t;
 
-    int top = 0;
+typedef struct{
+    int x;
+    int y;
 
-    if(img[sy * w + sx] == 0) return;
-    if(labels[sy * w + sx] != 0) return;
+    int id;
 
-    stack[top++] = (point_t){sx, sy};
+    int dx;
+    int dy;
 
-    while(top > 0){
+    int feature_count;
+}object_t;
 
-        point_t p = stack[--top];
-        int x = p.x;
-        int y = p.y;
 
-        if(x < 0 || x >= w || y < 0 || y >= h)
-            continue;
 
-        int idx = y * w + x;
 
-        if(img[idx] == 0)
-            continue;
+//for visualization only
 
-        if(labels[idx] != 0)
-            continue;
+void draw_pixel(uint8_t *img, int w, int h, int x, int y, uint8_t color){
 
-        labels[idx] = label_id;
+    if(x < 0 || x >= w) return;
+    if(y < 0 || y >= h) return;
 
-        // 4-neighborhood (faster)
-        stack[top++] = (point_t){x+1, y};
-        stack[top++] = (point_t){x-1, y};
-        stack[top++] = (point_t){x, y+1};
-        stack[top++] = (point_t){x, y-1};
+    img[y * w + x] = color;
+}
+
+void draw_cross(uint8_t *img, int w, int h, int x, int y){
+
+    for(int i = -3; i <= 3; i++){
+
+        draw_pixel(img, w, h, x + i, y, 255);
+        draw_pixel(img, w, h, x, y + i, 255);
     }
 }
 
 
-
 //define buffers once globally on startup to avoid repeated memory allocation
 
+
 static uint8_t *blurred = NULL;
+static uint8_t *prev_blurred = NULL;
+
 static int16_t *gx = NULL;
 static int16_t *gy = NULL;
-static uint8_t *edges = NULL;
-static uint8_t *labels = NULL;
-static point_t *stack = NULL; 
-static uint8_t *dilated = NULL; 
-static uint8_t *dilated_inv = NULL; 
-static uint8_t *eroded_inv = NULL; 
-static uint8_t *eroded = NULL; 
+static uint8_t *corners = NULL;
+
+uint8_t feature_count = 0;
+#define MAX_FEATURES 250
+
+static feature_t *points = NULL;
+
+#define MAX_OBJECTS 250
+static object_t *objects = NULL;
+
+static uint8_t *visual = NULL;
+
+
+
 
 
 
@@ -307,33 +291,26 @@ void process_frame(camera_fb_t *fb)
     int w = fb->width;
     int h = fb->height;
 
-     // allocate/reallocate if resolution changed
+     // allocate buffers
     if (!allocated_buffers) {
 
         free(blurred);
         free(gx);
         free(gy);
-        free(edges);
-        free(labels);
-        free(stack);
-        free(dilated);
-        free(dilated_inv);
-        free(eroded_inv);
-        free(eroded);
+        free(corners);
+
         
         blurred = malloc(w * h);
+        prev_blurred = malloc(w * h);
         gx = malloc(w * h * sizeof(int16_t));
         gy = malloc(w * h * sizeof(int16_t));
-        edges = malloc(w * h);
-        labels = malloc(w * h);
-        stack  = malloc(w * h * sizeof(point_t));
-        dilated = malloc(w * h);
-        dilated_inv = malloc(w * h);
-        eroded_inv = malloc(w * h);
-        eroded = malloc(w * h);
+        corners = malloc(w * h);
+        points = malloc(MAX_FEATURES * sizeof(feature_t));
+        objects = malloc(MAX_OBJECTS * sizeof(object_t));
+        visual = malloc(w * h);
 
 
-        if (!blurred || !gx || !gy || !edges) {
+        if (!blurred || !gx || !gy || !corners) {
             ESP_LOGE("MEMORY", "Allocation failed");
             return;
         }
@@ -341,53 +318,187 @@ void process_frame(camera_fb_t *fb)
         allocated_buffers = true;
     }
 
+
+    feature_count = 0;
     
     if (fb->format == PIXFORMAT_GRAYSCALE && w == 160 && h == 120) {
+
+        memset(corners, 0, w * h);
+        memset(gx, 0, w * h * sizeof(int16_t));
+        memset(gy, 0, w * h * sizeof(int16_t));
         
         apply_kernel(fb->buf, blurred, gaussian3x3, 16, w, h);
+
+        memcpy(visual, blurred, w * h);
         
         apply_kernel_t16(blurred, gx, GX_3x3, 1, w, h);
         apply_kernel_t16(blurred, gy, GY_3x3, 1, w, h);
 
-        for(int y = 0; y < h; y++){
-            for(int x = 0; x < w; x++){
+
+        int max_val = 0;//for adaptive thresholding
+        for(int y = 8; y < h-8; y++){
+            for(int x = 8; x < w-8; x++){
 
                 int idx = y * w + x;
 
-                int magnitude = abs(gx[idx]) + abs(gy[idx]);
+                int16_t GX = gx[idx];
+                int16_t GY = gy[idx];
 
-                if(magnitude > THRESHOLD){
-                    edges[idx] = 255;
+                int G_all = GX*GX + GY*GY;
+                if(G_all > max_val){
+                    max_val = G_all;
+                }
+
+                if(G_all > THRESHOLD){
+                    corners[idx] = 255;
+
+                    if(feature_count < MAX_FEATURES){
+                        points[feature_count].x = x;
+                        points[feature_count].y = y;
+
+                        feature_count += 1;
+                    }
+
                 }else{
-                    edges[idx] = 0;
+                    corners[idx] = 0;
                 }
 
 
             }
         }
+        int new_threshold = max_val * 0.12;
 
-    dilate(edges, dilated, w, h);
-    erode(dilated, eroded, w, h);
+        THRESHOLD = (THRESHOLD * 7 + new_threshold) / 8;
+
+        for(int p = 0; p < feature_count; p++){
+                    
+            int min_score = 1e9;
+            int best_dx = 4;
+            int best_dy = 4;
+            
+            for(int dy = -4; dy < 4; dy++){
+                for(int dx = -4; dx < 4; dx++){
+
+                    if(points[p].x + dx - 2 < 0) continue;
+                    if(points[p].x + dx + 2 >= w) continue;
+
+                    if(points[p].y + dy - 2 < 0) continue;
+                    if(points[p].y + dy + 2 >= h) continue;
+                        
+                    int score = sad_score(blurred, prev_blurred, points[p].x, points[p].y, dx, dy, w);
+                    if(score < min_score){
+
+                        min_score = score;
+                        best_dx = dx;
+                        best_dy = dy;
+                        
+                    }
+                    
+                }   
+            }
+            
+            
+            if(min_score < 500){
+                
+                points[p].dx = best_dx;
+                points[p].dy = best_dy;
+                
+            }else{
+                points[p] = points[feature_count - 1];
+                feature_count -= 1;
+                p -= 1;
+            }
+            
+        }
 
 
-
-    /*
-    uint16_t label = 1;
-
-    memset(labels, 0, w * h);
+    memset(objects, 0, MAX_OBJECTS * sizeof(object_t));
+    int object_count = 0;
     
-    for(int y = 0; y < h; y++){
-        for(int x = 0; x < w; x++){
+    for(int p = 0; p < feature_count; p++) {
 
-            int idx = y * w + x;
+        bool found = false;
 
-            if(edges[idx] == 0 && labels[idx] == 0){
-                flood_fill(edges, labels, stack, w, h, x, y, label);
-                label++;
+        for(int o = 0; o < object_count; o++) {
+
+            int ox = objects[o].x / objects[o].feature_count;
+            int oy = objects[o].y / objects[o].feature_count;
+
+            int dx = points[p].x - ox;
+            int dy = points[p].y - oy;
+
+            int dist2 = dx*dx + dy*dy;
+
+            if(dist2 < 400) {
+
+                // merge into object
+                objects[o].x += points[p].x;
+                objects[o].y += points[p].y;
+
+                objects[o].dx += points[p].dx;
+                objects[o].dy += points[p].dy;
+
+                objects[o].feature_count++;
+
+                found = true;
+                break;
             }
         }
+
+    
+        if(!found && object_count < MAX_OBJECTS) {
+
+            objects[object_count].x = points[p].x;
+            objects[object_count].y = points[p].y;
+
+            objects[object_count].dx = points[p].dx;
+            objects[object_count].dy = points[p].dy;
+
+            objects[object_count].feature_count = 1;
+
+            objects[object_count].id = object_count;
+
+            object_count++;
+        }
+
+
     }
-      */  
+
+    for(int o = 0; o < object_count; o++) {
+
+        int n = objects[o].feature_count;
+
+        int avg_x = objects[o].x / n;
+        int avg_y = objects[o].y / n;
+
+        int avg_dx = objects[o].dx / n;
+        int avg_dy = objects[o].dy / n;
+
+        objects[o].x = avg_x;
+        objects[o].y = avg_y;
+
+        objects[o].dx = avg_dx;
+        objects[o].dy = avg_dy;
+    }
+
+    for(int o = 0; o < object_count; o++){
+
+        if(objects[o].feature_count < 4)
+            continue;
+
+        draw_cross(
+            visual,
+            w,
+            h,
+            objects[o].x,
+            objects[o].y
+        );
+    }
+
+
+
+
+    memcpy(prev_blurred, blurred, w * h);
         
     } else {
         ESP_LOGE("FRAME PROCESSING", "unexpected image format!");
@@ -423,13 +534,13 @@ void frame_processing_task(void *arg)
 
         if (streaming && fb) {
 
-            frame_id++;
+            frame_id++;  
 
             stream_buffer = NULL;
             stream_size = 0;
 
             //chage to whatever buffer and size i want
-            stream_buffer = eroded;
+            stream_buffer = visual;
             stream_size = fb->height * fb->width;
 
             uint16_t total_packets =
