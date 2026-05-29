@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_camera.h"
 
+
 #define WIFI_SSID      "NHome"
 #define WIFI_PASS      "Bright6963Dance"
 
@@ -54,8 +55,15 @@ static void wifi_init(void)
 }
 
 
-int THRESHOLD = 10000; // sensitivity of edge detection
+int THRESHOLD = 20; // sensitivity of corner detection
 #define FRAME_QUEUE_LENGTH 2
+
+
+
+
+
+
+
 
 
 camera_config_t camera_config = {
@@ -169,32 +177,46 @@ void apply_kernel(uint8_t *input, uint8_t *output, const int8_t *kernel, int div
 
 }
 
-void apply_kernel_t16(uint8_t *input, int16_t *output, const int8_t *kernel, int divisor, int w, int h){
+int8_t circle[16][2] = {
+    { 0,-3}, { 1,-3}, { 2,-2}, { 3,-1},
+    { 3, 0}, { 3, 1}, { 2, 2}, { 1, 3},
+    { 0, 3}, {-1, 3}, {-2, 2}, {-3, 1},
+    {-3, 0}, {-3,-1}, {-2,-2}, {-1,-3}
+};
 
-    for(int y = 1; y < h - 1; y++){
-        for(int x = 1; x < w - 1; x++){
+int max_diff = 0;
 
-            int pixel = (input[(y-1) * w + (x-1)] * kernel[0] +
-                            input[(y-1) * w + (x)] * kernel[1] +
-                            input[(y-1) * w + (x+1)] * kernel[2] +
-                            input[(y) * w + (x-1)] * kernel[3] +
-                            input[(y) * w + (x)] * kernel[4] +
-                            input[(y) * w + (x+1)] * kernel[5] +
-                            input[(y+1) * w + (x-1)] * kernel[6] +
-                            input[(y+1) * w + (x)] * kernel[7] +
-                            input[(y+1) * w + (x+1)] * kernel[8]
-            ); 
+uint8_t fast_corner(uint8_t *input, int x, int y, int w, int8_t offsets[][2]){
+
+        uint8_t contiguous_count = 0;
+        uint8_t best_count = 0;
+
+
+        uint8_t center = input[y * w + x];
+
+        for(int i = 0; i < 16; i++){
+
+            int dx = offsets[i][0];
+            int dy = offsets[i][1];
             
-                            
-            pixel /= divisor;
+            uint8_t target = input[(y + dy) * w + (x + dx)];
 
-            output[y * w + x] = pixel;
+            if(abs(center - target) > max_diff){
+                max_diff = abs(center - target);
+            }
+
+            if(abs(center - target) > THRESHOLD){
+                contiguous_count += 1;
+            }else{
+                best_count = contiguous_count;
+                contiguous_count = 0;
+            }
 
         }
-    }
+
+        return best_count;
 
 }
-
 
 int sad_score(uint8_t *curr, uint8_t *prev, int x, int y, int dx, int dy, uint8_t w){
     
@@ -269,11 +291,11 @@ static int16_t *gy = NULL;
 static uint8_t *corners = NULL;
 
 uint8_t feature_count = 0;
-#define MAX_FEATURES 250
+#define MAX_FEATURES 100
 
 static feature_t *points = NULL;
 
-#define MAX_OBJECTS 250
+#define MAX_OBJECTS 20
 static object_t *objects = NULL;
 
 static uint8_t *visual = NULL;
@@ -322,34 +344,22 @@ void process_frame(camera_fb_t *fb)
     feature_count = 0;
     
     if (fb->format == PIXFORMAT_GRAYSCALE && w == 160 && h == 120) {
-
-        memset(corners, 0, w * h);
-        memset(gx, 0, w * h * sizeof(int16_t));
-        memset(gy, 0, w * h * sizeof(int16_t));
         
         apply_kernel(fb->buf, blurred, gaussian3x3, 16, w, h);
 
         memcpy(visual, blurred, w * h);
         
-        apply_kernel_t16(blurred, gx, GX_3x3, 1, w, h);
-        apply_kernel_t16(blurred, gy, GY_3x3, 1, w, h);
+        max_diff = 0;
 
-
-        int max_val = 0;//for adaptive thresholding
         for(int y = 8; y < h-8; y++){
             for(int x = 8; x < w-8; x++){
 
                 int idx = y * w + x;
 
-                int16_t GX = gx[idx];
-                int16_t GY = gy[idx];
+                uint8_t largest_arc = fast_corner(blurred, x, y, w, circle);
 
-                int G_all = GX*GX + GY*GY;
-                if(G_all > max_val){
-                    max_val = G_all;
-                }
 
-                if(G_all > THRESHOLD){
+                if(largest_arc > 9){//play with this value and add maximum suppresion if noisy
                     corners[idx] = 255;
 
                     if(feature_count < MAX_FEATURES){
@@ -357,6 +367,8 @@ void process_frame(camera_fb_t *fb)
                         points[feature_count].y = y;
 
                         feature_count += 1;
+                    }else{
+                        ESP_LOGE("FEATURE DETECTION:", "TOO NOISY");
                     }
 
                 }else{
@@ -366,9 +378,10 @@ void process_frame(camera_fb_t *fb)
 
             }
         }
-        int new_threshold = max_val * 0.12;
 
-        THRESHOLD = (THRESHOLD * 7 + new_threshold) / 8;
+        THRESHOLD = max_diff * 0.18;//tune this
+
+
 
         for(int p = 0; p < feature_count; p++){
                     
@@ -398,12 +411,14 @@ void process_frame(camera_fb_t *fb)
             }
             
             
-            if(min_score < 500){
+            if(min_score < 500){//tune
                 
                 points[p].dx = best_dx;
                 points[p].dy = best_dy;
                 
             }else{
+
+                //remove the feature from the list if it is lost
                 points[p] = points[feature_count - 1];
                 feature_count -= 1;
                 p -= 1;
@@ -421,15 +436,25 @@ void process_frame(camera_fb_t *fb)
 
         for(int o = 0; o < object_count; o++) {
 
+            //object centroid
             int ox = objects[o].x / objects[o].feature_count;
             int oy = objects[o].y / objects[o].feature_count;
 
+
+            //feature's distance from object centroid
             int dx = points[p].x - ox;
             int dy = points[p].y - oy;
 
             int dist2 = dx*dx + dy*dy;
 
-            if(dist2 < 400) {
+
+            //checking if the feature and object have similar motion
+            int ddx =  abs(objects[o].dx - points[p].dx);
+            int ddy =  abs(objects[o].dy - points[p].dy);
+
+            int avg = (ddx + ddy)/2;
+
+            if(dist2 < 50*50 && avg < 16) {//within 50 pixels radius and similar mvt within 16 pixels
 
                 // merge into object
                 objects[o].x += points[p].x;
@@ -483,7 +508,7 @@ void process_frame(camera_fb_t *fb)
 
     for(int o = 0; o < object_count; o++){
 
-        if(objects[o].feature_count < 4)
+        if(objects[o].feature_count < 3)
             continue;
 
         draw_cross(
@@ -600,6 +625,7 @@ void app_main(void)
     if (frame_queue == NULL) {
         ESP_LOGE("QUEUE", "Failed to create frame queue");
     }
+
 
     xTaskCreatePinnedToCore(
         capture_frame_task,
